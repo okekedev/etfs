@@ -242,6 +242,8 @@ def run_scan():
     for und in sorted(watch_tickers):
         if und not in latest.index: continue
         prev_close = latest.loc[und, "close"]; sig20 = latest.loc[und, "sig20"]
+        if prev_close <= 3 and und not in set(open_pos["und"] if len(open_pos) else []):
+            continue  # universe gate: price > $3 (open positions still managed)
         n3, total, spot = poll_chain(und, prev_close, sig20)
         sh = n3 / total if total > 0 else 0.0
         dr = drift.get(und, np.nan)
