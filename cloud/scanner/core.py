@@ -322,7 +322,8 @@ def run_scan():
             ret = c.get("exit_ret")
             if pd.isna(ret) and pd.notna(c.get("exit_price")): ret = c["exit_price"]/c["entry"]-1
             rec = {"und": c["und"], "fired": str(c["date"])[:10], "exited": str(c.get("exit_date",""))[:10],
-                   "ret": float(ret) if pd.notna(ret) else 0.0, "reason": str(c.get("exit_reason",""))}
+                   "ret": float(ret) if pd.notna(ret) else 0.0,
+                   "reason": str(c.get("exit_reason","")) + (" · " + str(c.get("rule","")) if c.get("mode") == "shadow" else "")}
             (shadow_closed if c.get("mode") == "shadow" else closed).append(rec)
     shadow_open_n = len(open_all[open_all["mode"] == "shadow"]) if len(open_all) else 0
 
@@ -370,7 +371,6 @@ def build_sigma_day(df, date_str, closes):
     ext = df["ticker"].str.extract(r"^O:([A-Z]+[0-9]*?)(\d{6})([CP])(\d{8})$")
     ext.columns = ["root","exp","cp","strike"]
     df = pd.concat([df, ext], axis=1).dropna(subset=["root"])
-    df = df[df["cp"] == "C"].copy()
     df["strike"] = df["strike"].astype(float) / 1000.0
     df["spot"] = df["root"].map(day_full["close"])
     df["sig"] = df["root"].map(day_full["sig20"])
@@ -382,8 +382,13 @@ def build_sigma_day(df, date_str, closes):
     df["sigma_dist"] = np.log(df["strike"]/df["spot"]) / (df["sig"] * np.sqrt(df["dte"] * 252/365))
     df["notional"] = df["volume"] * df["opt_close"] * 100
     near = df["dte"] <= DTE_MAX
-    df["n3"] = df["notional"].where((df["sigma_dist"] >= SIGMA_MIN) & near, 0)
-    g = df.groupby("root").agg(call_notional=("notional","sum"), n3_notional=("n3","sum")).reset_index()
+    is_call = df["cp"] == "C"
+    df["cn"] = df["notional"].where(is_call, 0)
+    df["n3"] = df["notional"].where(is_call & (df["sigma_dist"] >= SIGMA_MIN) & near, 0)
+    df["pn"] = df["notional"].where(~is_call, 0)
+    df["p3"] = df["notional"].where(~is_call & (df["sigma_dist"] <= -SIGMA_MIN) & near, 0)
+    g = df.groupby("root").agg(call_notional=("cn","sum"), n3_notional=("n3","sum"),
+                               put_notional=("pn","sum"), p3_notional=("p3","sum")).reset_index()
     g = g.rename(columns={"root":"und"}); g["date"] = day
     return g
 
@@ -407,6 +412,8 @@ def run_eod():
         srow = build_sigma_day(da, d, closes)
         if srow is not None:
             sb = pd.concat([sb, srow], ignore_index=True)
+            for _c in ["put_notional","p3_notional"]:
+                if _c in sb.columns: sb[_c] = sb[_c].fillna(0)
             msgs.append(f"{d}: built ({len(srow)} und)")
     # trim closes to last 90 days
     cutoff = pd.Timestamp(now_et().date()) - pd.Timedelta(days=130)
@@ -441,17 +448,32 @@ def run_eod():
         f["n310"] = g["n3_notional"].apply(lambda s: s.rolling(10, min_periods=5).sum())
         f["sh10"] = f["n310"] / f["cn10"].replace(0, np.nan)
         last_day_ts = f["date"].max()
-        tod = f[(f["date"] == last_day_ts) & (f["sh10"] >= 0.2) & (f["n310"] >= FIRE_NOTIONAL) &
-                f["drift_10d"].between(DRIFT_LO, DRIFT_HI) & (f["close"] > 3) & (f["cn10"] >= 100_000)]
-        for _, r in tod.iterrows():
-            family = fam(r["und"])
-            shadow_prior = log[(log["mode"] == "shadow") & (log["family"] == family) &
-                               (log["date"] > last_day_ts - pd.Timedelta(days=DEDUP_DAYS))]
-            if len(shadow_prior): continue
-            log = pd.concat([log, pd.DataFrame([{"date": last_day_ts, "und": r["und"], "family": family,
-                    "entry": r["close"], "status": "open", "mode": "shadow",
-                    "rule": "v5.0 (10d window)"}])], ignore_index=True)
-            msgs.append(f"shadow fire: {r['und']}")
+        for _c in ["p3_notional","put_notional"]:
+            if _c not in f.columns: f[_c] = 0.0
+            f[_c] = f[_c].fillna(0)
+        f["p3_3d"] = g["p3_notional"].apply(lambda s: s.rolling(3, min_periods=2).sum())
+        f["p3_p7"] = g["p3_notional"].apply(lambda s: s.shift(3).rolling(7, min_periods=4).sum())
+        f["put_absent"] = (f["p3_3d"].fillna(0) < 25_000) & (f["p3_p7"].fillna(0) < 25_000)
+
+        def log_shadow(rows, rule_name):
+            nonlocal log
+            for _, r in rows.iterrows():
+                family = fam(r["und"])
+                prior = log[(log["mode"] == "shadow") & (log["rule"] == rule_name) &
+                            (log["family"] == family) &
+                            (log["date"] > last_day_ts - pd.Timedelta(days=DEDUP_DAYS))]
+                if len(prior): continue
+                log = pd.concat([log, pd.DataFrame([{"date": last_day_ts, "und": r["und"], "family": family,
+                        "entry": r["close"], "status": "open", "mode": "shadow",
+                        "rule": rule_name}])], ignore_index=True)
+                msgs.append(f"shadow[{rule_name}] fire: {r['und']}")
+
+        base_gate = (f["date"] == last_day_ts) & (f["close"] > 3) & (f["cn10"] >= 100_000) & \
+                    f["drift_10d"].between(DRIFT_LO, DRIFT_HI)
+        log_shadow(f[base_gate & (f["sh10"] >= 0.2) & (f["n310"] >= FIRE_NOTIONAL)],
+                   "v5.0 (10d window)")
+        log_shadow(f[base_gate & (f["sh10"] >= 0.10) & (f["n310"] >= FIRE_NOTIONAL) & f["put_absent"]],
+                   "v5.2 (sh10 + $250k + put-ABSENT)")
 
     write_csv_blob("closes.csv", closes)
     if sb is not None: write_csv_blob("sigma_bets_daily.csv", sb)
