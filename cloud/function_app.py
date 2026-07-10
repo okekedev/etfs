@@ -24,17 +24,24 @@ def eod_update(timer: func.TimerRequest) -> None:
     result = core.run_eod()
     logging.info("eod_update: %s", result)
 
-# actionable brief email — pre-close + morning (times are UTC; CDT = UTC-5 in summer)
-@app.timer_trigger(schedule="0 30 19 * * 1-5", arg_name="timer", run_on_startup=False)
-def brief_preclose(timer: func.TimerRequest) -> None:   # 2:30p CT / 3:30p ET — buy before close
+# Actionable brief email — pre-close (2:30p CT) + morning (3:00a CT). Each fires at
+# BOTH DST-candidate UTC times; send_brief gates on real Central time so the send
+# lands at the right Central slot year-round (no dependence on WEBSITE_TIME_ZONE).
+@app.timer_trigger(schedule="0 30 19,20 * * 1-5", arg_name="timer", run_on_startup=False)
+def brief_preclose(timer: func.TimerRequest) -> None:   # 19:30 UTC=CDT, 20:30 UTC=CST -> 2:30p CT
     logging.info("brief_preclose: %s", core.send_brief("pm"))
 
-@app.timer_trigger(schedule="0 0 8 * * 1-5", arg_name="timer", run_on_startup=False)
-def brief_morning(timer: func.TimerRequest) -> None:    # 3:00a CT / 4:00a ET
+@app.timer_trigger(schedule="0 0 8,9 * * 1-5", arg_name="timer", run_on_startup=False)
+def brief_morning(timer: func.TimerRequest) -> None:    # 08:00 UTC=CDT, 09:00 UTC=CST -> 3:00a CT
     logging.info("brief_morning: %s", core.send_brief("am"))
 
 @app.route(route="run", auth_level=func.AuthLevel.FUNCTION)
 def run_manual(req: func.HttpRequest) -> func.HttpResponse:
     job = req.params.get("job", "scan")
-    result = core.run_eod() if job == "eod" else core.run_scan()
+    if job == "eod":
+        result = core.run_eod()
+    elif job == "brief":
+        result = core.send_brief(req.params.get("tag", "pm"), force=True)
+    else:
+        result = core.run_scan()
     return func.HttpResponse(result, status_code=200)

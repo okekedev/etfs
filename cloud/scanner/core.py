@@ -14,6 +14,7 @@ import logging
 import os
 import urllib.request
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -101,7 +102,15 @@ def get_json(url):
         return {"_error": str(e)}
 
 def now_et():
-    return datetime.now(timezone.utc) - timedelta(hours=4)   # EDT approximation
+    # DST-correct Eastern, returned naive (callers use .date()/.hour/.strftime)
+    return datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+
+def now_central():
+    return datetime.now(ZoneInfo("America/Chicago"))
+
+# Central-local slots the brief should land at (hour, minute); timers fire at both
+# DST-candidate UTC times and send_brief gates on the real Central hour.
+BRIEF_SLOTS = {"pm": (14, 30), "am": (3, 0)}
 
 def load_state():
     closes = read_csv_blob("closes.csv")
@@ -315,10 +324,17 @@ def render_daily_brief(rev_states, log, latest_close, day):
             f"<div style='font-size:11px;color:#aaa;margin-top:14px'>Buy fresh dip below 5-day MA, "
             f"hold {REV_HOLD}d. Full 10-ETF chart at the link.</div></div>")
 
-def send_brief(tag):
+def send_brief(tag, force=False):
     """Build + send the actionable brief from live ETF data. Runs on its own timer
     (pre-close + morning), independent of the heavy nightly EOD job. Uses the same
-    reversion_board() as the dashboard so numbers match. tag: 'pm' | 'am'."""
+    reversion_board() as the dashboard so numbers match. tag: 'pm' | 'am'.
+
+    DST: the timer fires at both candidate UTC times (CDT and CST); we only send
+    when the real Central hour matches the slot, so it lands at 2:30p/3:00a CT
+    year-round. `force=True` (manual endpoint) skips the gate for testing."""
+    slot_h = BRIEF_SLOTS[tag][0]
+    if not force and now_central().hour != slot_h:
+        return f"brief {tag}: skip (Central {now_central():%H:%M}, not the {slot_h}:00 slot)"
     _, _, log = load_state()
     board = reversion_board()
     states = [dict(tk=b["tk"], theme=b["theme"], dev5=b["cur"], thr=b["thr"], close=b["price"],
