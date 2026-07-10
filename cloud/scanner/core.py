@@ -96,16 +96,17 @@ def write_dashboard_blob(html):
         html, overwrite=True, content_settings=ContentSettings(content_type="text/html"))
 
 # ---------------- helpers ----------------
-def get_json(url, retries=4):
+def get_json(url, retries=6):
     """GET JSON with backoff on 429 so bursty fetches (e.g. the 10-ETF board)
-    don't silently drop tickers when the data plan rate-limits."""
+    don't silently drop tickers when the data plan rate-limits. Backoff totals
+    ~45s worst-case, which comfortably clears a per-minute rate window."""
     for i in range(retries):
         try:
             with urllib.request.urlopen(url, timeout=30) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             if e.code == 429 and i < retries - 1:
-                time.sleep(1.5 * (i + 1)); continue
+                time.sleep(3.0 * (i + 1)); continue
             return {"_error": f"HTTP {e.code}"}
         except Exception as e:
             return {"_error": str(e)}
@@ -363,7 +364,7 @@ def reversion_board():
     board = []
     for i, (tk, (theme, thr)) in enumerate(REV_UNIVERSE.items()):
         if i:
-            time.sleep(0.35)                    # throttle: avoid bursting the data plan's rate limit
+            time.sleep(1.2)                     # throttle: stay under the data plan's per-minute rate limit
         d = fetch_etf_daily(tk, days=120)
         if d is None or len(d) < REV_FAST + 2:
             continue
