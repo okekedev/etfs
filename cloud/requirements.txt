@@ -4,3 +4,4 @@ numpy
 boto3
 azure-storage-blob
 azure-communication-email
+tzdata
