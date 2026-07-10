@@ -365,7 +365,8 @@ def reversion_board():
     board = []
     for i, (tk, (theme, thr)) in enumerate(REV_UNIVERSE.items()):
         if i:
-            time.sleep(1.2)                     # throttle: stay under the data plan's per-minute rate limit
+            time.sleep(13)      # data plan = 5 req/min; ~13s spacing keeps all 10 fetches under it
+                                # deterministically (retry-backoff alone starves exactly one ticker)
         d = fetch_etf_daily(tk, days=120)
         if d is None or len(d) < REV_FAST + 2:
             continue
