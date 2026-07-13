@@ -586,6 +586,59 @@ def run_scan():
     return (f"scan ok: fires={len(fires)} watch={len(watch)} "
             f"buyzone={len(buy_hits)} aligned={len(align_hits)}")
 
+# ---------------- microcap relative-flow shadow log ----------------
+# The "WRAP signature" (research, Jul 2026): a sub-$5 stock whose daily CALL
+# notional runs >=10x its OWN trailing 20d median on >=2 of the last 3 days,
+# with a near-silent put tape, while the stock isn't already popping. Backtest
+# on Apr-Jul without the put leg capped at ~2-3x lift (the classic "how much
+# flow" ceiling); the put-silence leg is only testable FORWARD because the
+# seeded history has no put data. So: log candidates, no alerts, no positions.
+MICRO_PX_LO, MICRO_PX_HI = 0.5, 5.0
+MICRO_SPIKE_MIN  = 10_000   # $ call notional floor per spike day
+MICRO_SPIKE_X    = 10       # vs own trailing 20d median call notional
+MICRO_PUT_SH_MAX = 0.10     # put notional <= 10% of call notional
+MICRO_POP_MAX    = 0.15     # skip if the stock already jumped >=15% today
+MICRO_DEDUP_DAYS = 14
+
+def microcap_events(closes, sb, prior):
+    """Return new candidate rows for the latest day in `sb` (empty df if none).
+    Pure function of the state frames so it can be tested offline."""
+    cols = ["date","und","close","day_ret","call_notional","x_base","put_share","spikes_3d"]
+    if sb is None or "put_notional" not in sb.columns:
+        return pd.DataFrame(columns=cols)
+    sbx = sb.sort_values(["und","date"]).copy()
+    sbx["base_med"] = sbx.groupby("und")["call_notional"].transform(
+        lambda s: s.rolling(20, min_periods=10).median().shift(1))
+    sbx["spike"] = (sbx["call_notional"] >= MICRO_SPIKE_MIN) & \
+                   (sbx["call_notional"] >= MICRO_SPIKE_X * sbx["base_med"].clip(lower=500))
+    sbx["spikes_3d"] = sbx.groupby("und")["spike"].transform(
+        lambda s: s.rolling(3, min_periods=1).sum())
+    day = sbx["date"].max()
+    t = sbx[(sbx["date"] == day) & sbx["spike"] & (sbx["spikes_3d"] >= 2)].copy()
+    if t.empty:
+        return pd.DataFrame(columns=cols)
+    t["put_share"] = t["put_notional"].fillna(0) / t["call_notional"]
+    t = t[t["put_share"] <= MICRO_PUT_SH_MAX]
+    # price band + not-already-popping, from the two latest closes
+    c = closes.sort_values(["und","date"])
+    tail = c.groupby("und").tail(2)
+    last = tail.groupby("und")["close"].last()
+    prev = tail.groupby("und")["close"].first()
+    t["close"] = t["und"].map(last)
+    t["day_ret"] = t["und"].map(last / prev - 1)
+    t = t[t["close"].between(MICRO_PX_LO, MICRO_PX_HI) & (t["day_ret"] < MICRO_POP_MAX)]
+    if prior is not None and len(prior):
+        recent = prior[pd.to_datetime(prior["date"]) > day - pd.Timedelta(days=MICRO_DEDUP_DAYS)]
+        t = t[~t["und"].isin(set(recent["und"]))]
+    if t.empty:
+        return pd.DataFrame(columns=cols)
+    t["x_base"] = (t["call_notional"] / t["base_med"].clip(lower=500)).round(1)
+    t["date"] = t["date"].dt.strftime("%Y-%m-%d")
+    out = t[cols].copy()
+    for col, nd in [("close",4),("day_ret",4),("call_notional",0),("put_share",3)]:
+        out[col] = out[col].astype(float).round(nd)
+    return out
+
 # ---------------- EOD UPDATE (nightly) ----------------
 def _s3():
     import boto3
@@ -678,4 +731,15 @@ def run_eod():
     # fire detection and the reversion board.
     write_csv_blob("closes.csv", closes)
     if sb is not None: write_csv_blob("sigma_bets_daily.csv", sb)
+
+    # microcap relative-flow shadow log — candidates only, no alerts (see above)
+    try:
+        micro = read_csv_blob("microcap_log.csv")
+        new = microcap_events(closes, sb, micro)
+        if len(new):
+            micro = pd.concat([micro, new], ignore_index=True) if micro is not None else new
+            write_csv_blob("microcap_log.csv", micro)
+            msgs.append(f"microcap: logged {', '.join(new['und'])}")
+    except Exception as e:
+        logging.warning("microcap log: %s", e)
     return "eod ok: " + ("; ".join(msgs) if msgs else "nothing new")
