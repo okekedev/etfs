@@ -589,10 +589,15 @@ def run_scan():
 # ---------------- microcap relative-flow shadow log ----------------
 # The "WRAP signature" (research, Jul 2026): a sub-$5 stock whose daily CALL
 # notional runs >=10x its OWN trailing 20d median on >=2 of the last 3 days,
-# with a near-silent put tape, while the stock isn't already popping. Backtest
-# on Apr-Jul without the put leg capped at ~2-3x lift (the classic "how much
-# flow" ceiling); the put-silence leg is only testable FORWARD because the
-# seeded history has no put data. So: log candidates, no alerts, no positions.
+# with a near-silent put tape, while the stock isn't already popping.
+#
+# NOTE: the pattern tested NEGATIVE prospectively (research/microcap_flow_cases.md
+# -- 505 forward events = ~1.3x lift, 1.0x with the relative-flow leg; the WRAP/
+# AARD/EVC positives were survivorship bias). This logger is NOT a signal: it is a
+# forward data-collection probe for the ONE leg untestable backward -- put silence
+# -- because the state blob only has put_notional from 2026-07-06. Log candidates
+# with their put behavior, no alerts, no positions; delete if puts show no
+# separation after a few weeks.
 MICRO_PX_LO, MICRO_PX_HI = 0.5, 5.0
 MICRO_SPIKE_MIN  = 10_000   # $ call notional floor per spike day
 MICRO_SPIKE_X    = 10       # vs own trailing 20d median call notional
