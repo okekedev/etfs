@@ -608,26 +608,16 @@ def run_scan():
             watch.append({"und": und, "spikes": n_spikes,
                           "note": "spike TODAY" if spike_today else "awaiting 2nd spike"})
 
-    window_end = np.busday_offset(np.datetime64(now_et().date()), 2, roll="forward")
-    window_end_s = pd.Timestamp(window_end).strftime("%a %b %-d")
-    for f_ in fires:
-        alert_once(f"fire:{f_['und']}:{today}", f"🔥 {f_['und']} — ${f_['spot']:.2f} — buy by {window_end_s}",
-            f"<div style='font-family:-apple-system,sans-serif;text-align:center;padding:24px'>"
-            f"<div style='font-size:40px;font-weight:800;color:#238636'>🔥 {f_['und']}</div>"
-            f"<div style='font-size:32px;font-weight:700;margin:8px 0'>${f_['spot']:.2f}</div>"
-            f"<div style='font-size:16px;color:#555'>buy by close {window_end_s}</div></div>")
-
-    # ETF reversion: fetch each ETF once (board) -> buy-at-close + alignment alerts + chart
+    # Intraday scan is DASHBOARD-ONLY now: no emails. Everything the user acts on
+    # goes out in the single 4:30a ET morning digest (ETF reversion + microcap
+    # flow). Sigma fires and the ETF board still render on the live dashboard.
     try:
         board = reversion_board()
-        buy_hits = scan_reversion_buyzone(board)
-        align_hits = scan_alignment(board)
     except Exception as e:
-        board = []; buy_hits = align_hits = []; logging.warning("reversion intraday scan: %s", e)
+        board = []; logging.warning("reversion intraday scan: %s", e)
 
     write_dashboard_blob(render_dashboard(ts, fires, watch, eod_date, board))
-    return (f"scan ok: fires={len(fires)} watch={len(watch)} "
-            f"buyzone={len(buy_hits)} aligned={len(align_hits)}")
+    return f"scan ok (dashboard only): fires={len(fires)} watch={len(watch)}"
 
 # ---------------- microcap flow signal ----------------
 # Detector for the "WRAP/AARD/EVC signature" (research/microcap_flow_cases.md):
