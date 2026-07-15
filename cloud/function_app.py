@@ -1,12 +1,13 @@
 """Sigma-bet scanner — Azure Functions (Python v2 model).
 
 Timers (UTC; ET = UTC-4 in summer):
-  scan_cycle : every 2h during market hours (13:45, 15:45, 17:45, 19:45 UTC Mon-Fri
-               = 9:45a, 11:45a, 1:45p, 3:45p ET)
-  eod_update : 09:00 UTC Tue-Sat (5:00a ET) — flat files publish overnight
+  scan_cycle : every 2h market hours (9:45a-3:45p ET) — refreshes the dashboard
+               only; no emails.
+  eod_update : ~4:30a ET Tue-Sat — builds the flat-file data and sends the ONE
+               daily email (consolidated digest: ETF reversion + microcap flow).
 
 HTTP:
-  GET /api/run?job=scan|eod  (function key) — manual kick for testing
+  GET /api/run?job=scan|eod|brief  (function key) — manual kick for testing
 """
 import logging
 import azure.functions as func
@@ -19,21 +20,16 @@ def scan_cycle(timer: func.TimerRequest) -> None:
     result = core.run_scan()
     logging.info("scan_cycle: %s", result)
 
-@app.timer_trigger(schedule="0 0 9 * * 2-6", arg_name="timer", run_on_startup=False)
+# EOD build + the single daily email at ~4:30a ET, after the OPRA flat file
+# publishes (observed 11:45p-3:30a ET; 4:30 clears it with self-healing retries
+# for late files). Fires at BOTH DST-candidate UTC times (08:30=EDT, 09:30=EST);
+# run_eod is idempotent and sends the consolidated digest (ETF reversion +
+# microcap flow) via send_brief's Central-hour gate, so exactly one email lands
+# at ~4:30a ET (3:30a CT) year-round. This is the only email the app sends.
+@app.timer_trigger(schedule="0 30 8,9 * * 2-6", arg_name="timer", run_on_startup=False)
 def eod_update(timer: func.TimerRequest) -> None:
     result = core.run_eod()
     logging.info("eod_update: %s", result)
-
-# Actionable brief email — pre-close (2:30p CT) + morning (3:00a CT). Each fires at
-# BOTH DST-candidate UTC times; send_brief gates on real Central time so the send
-# lands at the right Central slot year-round (no dependence on WEBSITE_TIME_ZONE).
-@app.timer_trigger(schedule="0 30 19,20 * * 1-5", arg_name="timer", run_on_startup=False)
-def brief_preclose(timer: func.TimerRequest) -> None:   # 19:30 UTC=CDT, 20:30 UTC=CST -> 2:30p CT
-    logging.info("brief_preclose: %s", core.send_brief("pm"))
-
-@app.timer_trigger(schedule="0 0 8,9 * * 1-5", arg_name="timer", run_on_startup=False)
-def brief_morning(timer: func.TimerRequest) -> None:    # 08:00 UTC=CDT, 09:00 UTC=CST -> 3:00a CT
-    logging.info("brief_morning: %s", core.send_brief("am"))
 
 @app.route(route="run", auth_level=func.AuthLevel.FUNCTION)
 def run_manual(req: func.HttpRequest) -> func.HttpResponse:
@@ -41,7 +37,7 @@ def run_manual(req: func.HttpRequest) -> func.HttpResponse:
     if job == "eod":
         result = core.run_eod()
     elif job == "brief":
-        result = core.send_brief(req.params.get("tag", "pm"), force=True)
+        result = core.send_brief(req.params.get("tag", "am"), force=True)
     else:
         result = core.run_scan()
     return func.HttpResponse(result, status_code=200)
