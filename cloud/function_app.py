@@ -19,21 +19,22 @@ def scan_cycle(timer: func.TimerRequest) -> None:
     result = core.run_scan()
     logging.info("scan_cycle: %s", result)
 
-@app.timer_trigger(schedule="0 0 9 * * 2-6", arg_name="timer", run_on_startup=False)
+# EOD build + morning digest at ~4:30a ET, after the OPRA flat file publishes
+# (observed 11:45p-3:30a ET; 4:30 clears it with self-healing retries for late
+# files). Fires at BOTH DST-candidate UTC times (08:30=EDT, 09:30=EST); run_eod
+# is idempotent and it sends the consolidated morning digest via send_brief's
+# Central-hour gate so exactly one email lands at ~4:30a ET (3:30a CT) year-round.
+@app.timer_trigger(schedule="0 30 8,9 * * 2-6", arg_name="timer", run_on_startup=False)
 def eod_update(timer: func.TimerRequest) -> None:
     result = core.run_eod()
     logging.info("eod_update: %s", result)
 
-# Actionable brief email — pre-close (2:30p CT) + morning (3:00a CT). Each fires at
-# BOTH DST-candidate UTC times; send_brief gates on real Central time so the send
-# lands at the right Central slot year-round (no dependence on WEBSITE_TIME_ZONE).
+# Afternoon digest — pre-close (2:30p CT). Fires at BOTH DST-candidate UTC times;
+# send_brief gates on real Central time. The morning digest is folded into
+# eod_update above (one consolidated email: ETF reversion + microcap flow).
 @app.timer_trigger(schedule="0 30 19,20 * * 1-5", arg_name="timer", run_on_startup=False)
 def brief_preclose(timer: func.TimerRequest) -> None:   # 19:30 UTC=CDT, 20:30 UTC=CST -> 2:30p CT
     logging.info("brief_preclose: %s", core.send_brief("pm"))
-
-@app.timer_trigger(schedule="0 0 8,9 * * 1-5", arg_name="timer", run_on_startup=False)
-def brief_morning(timer: func.TimerRequest) -> None:    # 08:00 UTC=CDT, 09:00 UTC=CST -> 3:00a CT
-    logging.info("brief_morning: %s", core.send_brief("am"))
 
 @app.route(route="run", auth_level=func.AuthLevel.FUNCTION)
 def run_manual(req: func.HttpRequest) -> func.HttpResponse:

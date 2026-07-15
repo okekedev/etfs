@@ -324,26 +324,69 @@ def render_daily_brief(rev_states, day):
             f"<div style='font-size:11px;color:#aaa;margin-top:14px'>Buy fresh dip below 5-day MA, "
             f"hold ~{REV_HOLD} trading days. Full 10-ETF chart at the link.</div></div>")
 
-def send_brief(tag, force=False):
-    """Build + send the actionable brief from live ETF data. Runs on its own timer
-    (pre-close + morning), independent of the heavy nightly EOD job. Uses the same
-    reversion_board() as the dashboard so numbers match. tag: 'pm' | 'am'.
+def render_microcap_section(rows):
+    """HTML block for the microcap flow watchlist inside the digest. `rows` is a
+    list of dicts from microcap_signals(). Experimental — labelled as such."""
+    if not rows:
+        return ("<div style='margin-top:18px'><div style='font-size:11px;color:#999;"
+                "text-transform:uppercase;letter-spacing:.04em'>Microcap flow watch (experimental)</div>"
+                "<div style='font-size:13px;color:#888;margin:4px 0'>· none today</div></div>")
+    cards = ""
+    for r in rows:
+        cards += (f"<div style='background:#12261a;border:1px solid #238636;border-radius:8px;"
+                  f"padding:9px 11px;margin:6px 0'>"
+                  f"<div style='font-size:16px;font-weight:700;color:#238636'>🔎 {r['und']} "
+                  f"<span style='color:#222'>${r['close']:.2f}</span></div>"
+                  f"<div style='font-size:12px;color:#555;margin-top:2px'>${r['strike']:.1f} calls "
+                  f"({r['ks']:.2f}× spot) · ${r['call_notional']/1e3:.0f}k = {r['x_base']:.0f}× baseline · "
+                  f"{r['top_share']:.0%} one strike · puts {r['put_share']:.0%}</div>"
+                  f"<div style='font-size:11px;color:#888;margin-top:1px'>"
+                  f"{r['below_hi']:+.0%} vs 20d high · beaten-down + deep-OTM call buying</div></div>")
+    return ("<div style='margin-top:18px'><div style='font-size:11px;color:#999;"
+            "text-transform:uppercase;letter-spacing:.04em'>Microcap flow watch (experimental)</div>"
+            f"{cards}"
+            "<div style='font-size:10px;color:#aaa;margin-top:4px'>Unusual single-strike call buying "
+            "on beaten-down microcaps. ~9-day median lead; ~2/3 fizzle. Not advice — a watchlist.</div></div>")
+
+def load_micro_signals():
+    """Microcap signals from the blob the EOD job wrote. run_eod overwrites this
+    each morning with the latest build's flags, so it is always the current
+    watchlist (dated the prior trading session) until the next overnight build."""
+    df = read_csv_blob("microcap_signals.csv")
+    if df is None or not len(df):
+        return []
+    return df.to_dict("records")
+
+def send_brief(tag, force=False, micro=None):
+    """Build + send the consolidated digest: ETF reversion board + microcap flow
+    watch, in ONE email. Runs pre-close (2:30p CT) and, folded into run_eod, in the
+    morning after the flat file lands. tag: 'pm' | 'am'. `micro` (list of dicts) is
+    passed by run_eod with fresh signals; otherwise read from the blob.
 
     DST: the timer fires at both candidate UTC times (CDT and CST); we only send
-    when the real Central hour matches the slot, so it lands at 2:30p/3:00a CT
+    when the real Central hour matches the slot, so it lands at the right CT slot
     year-round. `force=True` (manual endpoint) skips the gate for testing."""
     slot_h = BRIEF_SLOTS[tag][0]
-    if not force and now_central().hour != slot_h:
+    if not force and tag in BRIEF_SLOTS and now_central().hour != slot_h:
         return f"brief {tag}: skip (Central {now_central():%H:%M}, not the {slot_h}:00 slot)"
     board = reversion_board()
     states = [dict(tk=b["tk"], dev5=b["cur"], thr=b["thr"], close=b["price"],
                    buy=(b["state"] == "buy"), r10=b["r10"], regime=b["regime"], prime=b["prime"])
               for b in board]
     day = now_et().strftime("%Y-%m-%d")
+    micro = micro if micro is not None else load_micro_signals()
     buys = [s["tk"] for s in states if s["buy"]]
-    subject = f"ETFs — BUY {', '.join(buys)}" if buys else f"ETFs · {day}"
-    alert_once(f"brief:{tag}:{day}", subject, render_daily_brief(states, day))
-    return f"brief {tag}: {len(buys)} buys / {len(states)} etf"
+    mtk = [m["und"] for m in micro]
+    tags = (["BUY " + ", ".join(buys)] if buys else []) + (["flow " + ", ".join(mtk)] if mtk else [])
+    subject = "ETFs — " + " · ".join(tags) if tags else f"ETFs · {day}"
+    alert_once(f"brief:{tag}:{day}", subject, _digest_html(states, micro, day))
+    return f"brief {tag}: {len(buys)} etf-buys / {len(micro)} microcap / {len(states)} etf"
+
+def _digest_html(states, micro, day):
+    """ETF brief + microcap section stitched into one mobile email."""
+    base = render_daily_brief(states, day)
+    inject = render_microcap_section(micro) + "<a href"
+    return base.replace("<a href", inject, 1)   # insert microcap just above the chart button
 
 # ---------------- intraday reversion ALIGNMENT (entry trigger) ----------------
 def fetch_etf_15m(tk, days=40):
@@ -586,63 +629,74 @@ def run_scan():
     return (f"scan ok: fires={len(fires)} watch={len(watch)} "
             f"buyzone={len(buy_hits)} aligned={len(align_hits)}")
 
-# ---------------- microcap relative-flow shadow log ----------------
-# The "WRAP signature" (research, Jul 2026): a sub-$5 stock whose daily CALL
-# notional runs >=10x its OWN trailing 20d median on >=2 of the last 3 days,
-# with a near-silent put tape, while the stock isn't already popping.
-#
-# NOTE: the pattern tested NEGATIVE prospectively (research/microcap_flow_cases.md
-# -- 505 forward events = ~1.3x lift, 1.0x with the relative-flow leg; the WRAP/
-# AARD/EVC positives were survivorship bias). This logger is NOT a signal: it is a
-# forward data-collection probe for the ONE leg untestable backward -- put silence
-# -- because the state blob only has put_notional from 2026-07-06. Log candidates
-# with their put behavior, no alerts, no positions; delete if puts show no
-# separation after a few weeks.
-MICRO_PX_LO, MICRO_PX_HI = 0.5, 5.0
-MICRO_SPIKE_MIN  = 10_000   # $ call notional floor per spike day
-MICRO_SPIKE_X    = 10       # vs own trailing 20d median call notional
-MICRO_PUT_SH_MAX = 0.10     # put notional <= 10% of call notional
-MICRO_POP_MAX    = 0.15     # skip if the stock already jumped >=15% today
+# ---------------- microcap flow signal ----------------
+# Detector for the "WRAP/AARD/EVC signature" (research/microcap_flow_cases.md):
+# a beaten-down small stock where one day's CALL notional runs >=15x its own
+# 30-day baseline, concentrated in a single OTM strike, with a near-silent put
+# tape. Case-control on this window (dose_response + the past-30d run) put the
+# tight variant at ~27% +30%/10d vs a ~4% base (6.6x) with a ~9-day median lead;
+# the differentiators were, in order: stock BEATEN DOWN (below its 20d high),
+# strike DEEP OTM (K/S>=1.4), and a THIN name -- NOT the raw spike multiple.
+# Caveat: validated in-sample on one 60-day window; ship as an experimental
+# watchlist and let forward data confirm. Needs the top-strike columns that
+# build_sigma_day now writes (top_strike/top_notional), so it fires only on days
+# built after this deploy.
+MICRO_PX_LO,  MICRO_PX_HI = 1.0, 10.0
+MICRO_SPIKE_X   = 15        # day call notional >= 15x own 30d median
+MICRO_CALL_MIN  = 8_000     # $ call notional floor
+MICRO_TOPSHARE  = 0.55      # single strike holds >=55% of call $
+MICRO_KS_LO, MICRO_KS_HI = 1.4, 3.0   # strike 1.4-3.0x spot (deep OTM)
+MICRO_PUT_MAX   = 0.20      # put notional <= 20% of call notional
+MICRO_BELOW_HI  = -0.15     # stock >=15% below its 20d high (beaten down)
+MICRO_THIN_BASE = 1_500     # 30d median call notional < $1.5k (thin/readable name)
 MICRO_DEDUP_DAYS = 14
 
-def microcap_events(closes, sb, prior):
-    """Return new candidate rows for the latest day in `sb` (empty df if none).
-    Pure function of the state frames so it can be tested offline."""
-    cols = ["date","und","close","day_ret","call_notional","x_base","put_share","spikes_3d"]
-    if sb is None or "put_notional" not in sb.columns:
+def microcap_signals(closes, sb, prior):
+    """Flag microcap flow signals for the latest day in `sb`. Pure function of the
+    state frames (offline-testable). Returns a DataFrame; empty if none fire."""
+    cols = ["date","und","close","strike","ks","call_notional","x_base","top_share",
+            "put_share","below_hi","dte"]
+    if sb is None or not {"top_strike","top_notional","put_notional"}.issubset(sb.columns):
         return pd.DataFrame(columns=cols)
     sbx = sb.sort_values(["und","date"]).copy()
-    sbx["base_med"] = sbx.groupby("und")["call_notional"].transform(
-        lambda s: s.rolling(20, min_periods=10).median().shift(1))
-    sbx["spike"] = (sbx["call_notional"] >= MICRO_SPIKE_MIN) & \
-                   (sbx["call_notional"] >= MICRO_SPIKE_X * sbx["base_med"].clip(lower=500))
-    sbx["spikes_3d"] = sbx.groupby("und")["spike"].transform(
-        lambda s: s.rolling(3, min_periods=1).sum())
+    sbx["base30"] = sbx.groupby("und")["call_notional"].transform(
+        lambda s: s.rolling(30, min_periods=8).median().shift(1))
     day = sbx["date"].max()
-    t = sbx[(sbx["date"] == day) & sbx["spike"] & (sbx["spikes_3d"] >= 2)].copy()
+    t = sbx[sbx["date"] == day].copy()
+    t = t[t["base30"].notna() & (t["base30"] < MICRO_THIN_BASE)]
+    t["x_base"] = t["call_notional"] / t["base30"].clip(lower=500)
+    t = t[(t["call_notional"] >= MICRO_CALL_MIN) & (t["x_base"] >= MICRO_SPIKE_X)]
     if t.empty:
         return pd.DataFrame(columns=cols)
-    t["put_share"] = t["put_notional"].fillna(0) / t["call_notional"]
-    t = t[t["put_share"] <= MICRO_PUT_SH_MAX]
-    # price band + not-already-popping, from the two latest closes
+    t["top_share"] = t["top_notional"] / t["call_notional"].replace(0, np.nan)
+    t["put_share"] = t["put_notional"].fillna(0) / t["call_notional"].replace(0, np.nan)
+    t = t[(t["top_share"] >= MICRO_TOPSHARE) & (t["put_share"] <= MICRO_PUT_MAX)]
+    if t.empty:
+        return pd.DataFrame(columns=cols)
+    # spot + 20-day-high distance (beaten-down filter) from closes
     c = closes.sort_values(["und","date"])
-    tail = c.groupby("und").tail(2)
-    last = tail.groupby("und")["close"].last()
-    prev = tail.groupby("und")["close"].first()
-    t["close"] = t["und"].map(last)
-    t["day_ret"] = t["und"].map(last / prev - 1)
-    t = t[t["close"].between(MICRO_PX_LO, MICRO_PX_HI) & (t["day_ret"] < MICRO_POP_MAX)]
+    spot = c.groupby("und")["close"].last()
+    hi20 = c.groupby("und")["close"].apply(lambda s: s.tail(20).max())
+    t["close"] = t["und"].map(spot)
+    t["below_hi"] = t["und"].map(spot / hi20 - 1)
+    t["strike"] = t["top_strike"]
+    t["ks"] = t["top_strike"] / t["close"]
+    t["dte"] = t["top_dte"] if "top_dte" in t.columns else np.nan
+    t = t[t["close"].between(MICRO_PX_LO, MICRO_PX_HI)
+          & t["ks"].between(MICRO_KS_LO, MICRO_KS_HI)
+          & (t["below_hi"] <= MICRO_BELOW_HI)]
     if prior is not None and len(prior):
         recent = prior[pd.to_datetime(prior["date"]) > day - pd.Timedelta(days=MICRO_DEDUP_DAYS)]
         t = t[~t["und"].isin(set(recent["und"]))]
     if t.empty:
         return pd.DataFrame(columns=cols)
-    t["x_base"] = (t["call_notional"] / t["base_med"].clip(lower=500)).round(1)
     t["date"] = t["date"].dt.strftime("%Y-%m-%d")
-    out = t[cols].copy()
-    for col, nd in [("close",4),("day_ret",4),("call_notional",0),("put_share",3)]:
+    t["x_base"] = t["x_base"].round(0)
+    out = t.reindex(columns=cols)
+    for col, nd in [("close",2),("ks",2),("call_notional",0),("top_share",2),
+                    ("put_share",2),("below_hi",2)]:
         out[col] = out[col].astype(float).round(nd)
-    return out
+    return out.sort_values("x_base", ascending=False)
 
 # ---------------- EOD UPDATE (nightly) ----------------
 def _s3():
@@ -702,6 +756,18 @@ def build_sigma_day(df, date_str, closes):
     g = df.groupby("root").agg(call_notional=("cn","sum"), n3_notional=("n3","sum"),
                                put_notional=("pn","sum"), p3_notional=("p3","sum")).reset_index()
     g = g.rename(columns={"root":"und"}); g["date"] = day
+    # top single CALL strike per root (for the microcap flow detector): the strike
+    # holding the most call notional among <=90 DTE calls, plus its notional and DTE.
+    # closes.csv carries spot; K/S and the concentration share are derived downstream.
+    calls = df[is_call & (df["dte"] <= 90)]
+    if len(calls):
+        ks = calls.groupby(["root","strike"]).agg(sn=("notional","sum"), dte=("dte","min")).reset_index()
+        top = ks.sort_values("sn", ascending=False).drop_duplicates("root").set_index("root")
+        g["top_strike"]   = g["und"].map(top["strike"])
+        g["top_notional"] = g["und"].map(top["sn"])
+        g["top_dte"]      = g["und"].map(top["dte"])
+    else:
+        g["top_strike"] = np.nan; g["top_notional"] = 0.0; g["top_dte"] = np.nan
     return g
 
 def run_eod():
@@ -737,14 +803,27 @@ def run_eod():
     write_csv_blob("closes.csv", closes)
     if sb is not None: write_csv_blob("sigma_bets_daily.csv", sb)
 
-    # microcap relative-flow shadow log — candidates only, no alerts (see above)
+    # microcap flow signal — validated detector. Write today's flags (for the
+    # digest) + append to the rolling log (history + 14d dedup source).
+    micro_rows = []
     try:
-        micro = read_csv_blob("microcap_log.csv")
-        new = microcap_events(closes, sb, micro)
+        log = read_csv_blob("microcap_log.csv")
+        new = microcap_signals(closes, sb, log)
+        micro_rows = new.to_dict("records")
+        write_csv_blob("microcap_signals.csv", new)          # current watchlist for the digest
         if len(new):
-            micro = pd.concat([micro, new], ignore_index=True) if micro is not None else new
-            write_csv_blob("microcap_log.csv", micro)
-            msgs.append(f"microcap: logged {', '.join(new['und'])}")
+            log = pd.concat([log, new], ignore_index=True) if log is not None else new
+            write_csv_blob("microcap_log.csv", log)
+            msgs.append(f"microcap: {', '.join(new['und'])}")
     except Exception as e:
-        logging.warning("microcap log: %s", e)
+        logging.warning("microcap signal: %s", e)
+
+    # send the consolidated morning digest now that fresh data + signals are in hand
+    # (replaces the old standalone brief_morning timer). run_eod fires at both DST
+    # candidate UTC times; send_brief's Central-hour gate lets exactly one land at
+    # ~4:30a ET, and alert_once is a second dedup backstop.
+    try:
+        msgs.append(send_brief("am", micro=micro_rows))
+    except Exception as e:
+        logging.warning("morning digest: %s", e)
     return "eod ok: " + ("; ".join(msgs) if msgs else "nothing new")
